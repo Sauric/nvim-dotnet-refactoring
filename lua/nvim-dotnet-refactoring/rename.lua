@@ -9,11 +9,32 @@ local TYPE_NODES = {
   record_struct_declaration = true,
 }
 
+-- Entering one of these means the cursor is inside a body, not a type header.
+local BODY_NODES = {
+  block = true,
+  accessor_list = true,
+}
+
 local uv = vim.uv or vim.loop
 
-local function find_type_node_at_cursor()
-  local node = vim.treesitter.get_node()
+-- When bufnr+pos are given (0-indexed), queries the parsed tree directly so
+-- the function works without a window or attached language tree (e.g. in tests).
+-- In normal use, omit both and it falls back to vim.treesitter.get_node().
+local function find_type_node_at_cursor(bufnr, pos)
+  local node
+  if bufnr and pos then
+    local parser = vim.treesitter.get_parser(bufnr, "c_sharp", { error = false })
+    if not parser then return end
+    local tree = parser:parse()[1]
+    if not tree then return end
+    node = tree:root():named_descendant_for_range(pos[1], pos[2], pos[1], pos[2])
+  else
+    node = vim.treesitter.get_node()
+  end
   while node do
+    if BODY_NODES[node:type()] then
+      return nil
+    end
     if TYPE_NODES[node:type()] then
       return node
     end
@@ -21,17 +42,18 @@ local function find_type_node_at_cursor()
   end
 end
 
-local function get_identifier(node)
+local function get_identifier(node, bufnr)
+  bufnr = bufnr or 0
   for child in node:iter_children() do
     if child:type() == "identifier" then
-      return vim.treesitter.get_node_text(child, 0)
+      return vim.treesitter.get_node_text(child, bufnr)
     end
   end
 end
 
 -- "MyClass.partial.cs" -> "MyClass"
-local function file_stem()
-  return vim.fn.expand("%:t"):match("^([^.]+)")
+local function file_stem(filename)
+  return (filename or vim.fn.expand("%:t")):match("^([^.]+)")
 end
 
 local function do_rename_file(old_name, new_name)
@@ -89,8 +111,9 @@ M.rename = function()
     return
   end
 
+  local bufnr = vim.api.nvim_get_current_buf()
   local type_node = find_type_node_at_cursor()
-  local old_name = type_node and get_identifier(type_node)
+  local old_name = type_node and get_identifier(type_node, bufnr)
   local stem = file_stem()
   local will_rename_file = old_name ~= nil and old_name == stem
   local default = old_name or vim.fn.expand("<cword>")
@@ -106,5 +129,12 @@ M.rename = function()
     apply_rename(new_name, old_name, will_rename_file)
   end)
 end
+
+M._internals = {
+  file_stem = file_stem,
+  get_identifier = get_identifier,
+  find_type_node_at_cursor = find_type_node_at_cursor,
+  do_rename_file = do_rename_file,
+}
 
 return M
