@@ -8,6 +8,7 @@ local KIND_LABEL = {
   [SK.Method]      = "method",
   [SK.Property]    = "property",
   [SK.Field]       = "field",
+  [SK.Constant]    = "constant",
   [SK.Constructor] = "constructor",
   [SK.Event]       = "event",
   [SK.Operator]    = "operator",

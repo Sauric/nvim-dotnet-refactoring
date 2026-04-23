@@ -179,6 +179,17 @@ describe("find_member_by_cursor", function()
     assert.is_not_nil(found)
     assert.equals("MyService(string)", found.name)
   end)
+
+  it("finds a const field member (SK.Constant)", function()
+    -- 'private const int buba = 4;' is reported by Roslyn as SK.Constant, not SK.Field.
+    -- The bug was that SK.Constant was absent from KIND_LABEL, so the member was
+    -- invisible to both find_member_by_cursor and the extractable-members filter.
+    local const_sym = sym("buba", SK.Constant, 3, 4, 3, 28)
+    local cls4      = sym("MyClass", SK.Class, 0, 0, 5, 1, { const_sym })
+    local found     = h.find_member_by_cursor(cls4, { 3, 10 })
+    assert.is_not_nil(found)
+    assert.equals("buba", found.name)
+  end)
 end)
 
 -- ── symbol_to_member ─────────────────────────────────────────────────────────
@@ -241,6 +252,16 @@ describe("symbol_to_member", function()
   it("labels nested interface correctly", function()
     local m = h.symbol_to_member(sym("IHandler", SK.Interface, 0, 0, 2, 1))
     assert.equals("nested interface", m.kind)
+  end)
+
+  it("labels constant correctly (SK.Constant)", function()
+    -- 'private const int buba = 4' → Roslyn reports SK.Constant.
+    -- Before the fix KIND_LABEL had no entry for SK.Constant, so the member
+    -- was silently ignored by both find_member_by_cursor and the extractable
+    -- member filter.
+    local m = h.symbol_to_member(sym("buba", SK.Constant, 0, 0, 0, 30))
+    assert.equals("buba",      m.name)
+    assert.equals("constant",  m.kind)
   end)
 
   it("falls back to 'member' for unmapped SymbolKind", function()
