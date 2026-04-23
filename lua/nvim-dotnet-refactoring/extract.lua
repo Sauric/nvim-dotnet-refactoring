@@ -359,7 +359,7 @@ M.extract = function()
   local cursor_idx = 1
   if cursor_sym then
     for i, m in ipairs(members) do
-      if m.name == cursor_sym.name then cursor_idx = i; break end
+      if m.symbol == cursor_sym then cursor_idx = i; break end
     end
   end
 

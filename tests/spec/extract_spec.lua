@@ -103,6 +103,17 @@ describe("find_member_by_cursor", function()
   it("returns nil when cursor is between members", function()
     assert.is_nil(h.find_member_by_cursor(cls, { 8, 0 }))
   end)
+
+  it("returns the symbol by reference so m.symbol == cursor_sym works", function()
+    -- Roslyn full-signature names differ from stripped m.name, so identity
+    -- comparison (m.symbol == cursor_sym) must be used, not name comparison.
+    local prop_full = sym("Name : string", SK.Property, 9, 4, 9, 40)
+    local cls2      = sym("Svc", SK.Class, 2, 0, 12, 1, { method, prop_full })
+    local found     = h.find_member_by_cursor(cls2, { 9, 10 })
+    assert.is_not_nil(found)
+    -- same table reference
+    assert.equals(prop_full, found)
+  end)
 end)
 
 -- ── symbol_to_member ─────────────────────────────────────────────────────────
