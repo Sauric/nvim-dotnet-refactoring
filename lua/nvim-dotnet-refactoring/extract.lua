@@ -319,7 +319,7 @@ local function do_extract(bufnr, class_sym, sel, full_path, fname)
   vim.fn.writefile(content, full_path)
   make_class_partial(bufnr, class_sym)
   remove_members(bufnr, sel)
-  vim.cmd("write")
+  vim.api.nvim_buf_call(bufnr, function() vim.cmd("write") end)
   vim.cmd("vsplit " .. vim.fn.fnameescape(full_path))
   vim.notify(string.format("[nvim-dotnet] Extracted %d member(s) → %s", #sel, fname))
 end
