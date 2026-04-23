@@ -1,6 +1,30 @@
 local rename = require("nvim-dotnet-refactoring.rename")
 local h = rename._internals
 
+local SK = vim.lsp.protocol.SymbolKind
+
+-- ── helpers ──────────────────────────────────────────────────────────────────
+
+-- name_sc: optional column where the name token starts (defaults to sc).
+-- Needed when leading modifiers push the name right of the declaration start.
+local function make_sym(name, kind, sl, sc, el, ec, name_sc_or_children, maybe_children)
+  local name_sc, children
+  if type(name_sc_or_children) == "number" then
+    name_sc  = name_sc_or_children
+    children = maybe_children or {}
+  else
+    name_sc  = sc
+    children = name_sc_or_children or {}
+  end
+  return {
+    name           = name,
+    kind           = kind,
+    range          = { start = { line = sl, character = sc }, ["end"] = { line = el, character = ec } },
+    selectionRange = { start = { line = sl, character = name_sc }, ["end"] = { line = sl, character = name_sc + #name } },
+    children       = children,
+  }
+end
+
 -- ---------------------------------------------------------------------------
 -- file_stem
 -- ---------------------------------------------------------------------------
@@ -20,87 +44,120 @@ describe("file_stem", function()
   it("handles a three-segment compound name", function()
     assert.equals("OrderService", h.file_stem("OrderService.queries.generated.cs"))
   end)
+
+  it("returns the whole string when there is no dot", function()
+    assert.equals("MyClass", h.file_stem("MyClass"))
+  end)
 end)
 
 -- ---------------------------------------------------------------------------
--- Treesitter-dependent tests — skipped when c_sharp parser is unavailable
+-- find_type_by_cursor
 -- ---------------------------------------------------------------------------
-local function cs_parser_available()
-  local ok = pcall(vim.treesitter.language.add, "c_sharp")
-  return ok
-end
+describe("find_type_by_cursor", function()
+  -- public class OrderService  (line 0; "OrderService" starts at col 13)
+  -- {                          (line 1)
+  --   public void DoWork() {   (line 2)
+  --     var x = 1;             (line 3)
+  --   }                        (line 4)
+  -- }                          (line 5)
+  local class_sym = make_sym("OrderService", SK.Class, 0, 0, 5, 1, 13, {
+    make_sym("DoWork", SK.Method, 2, 2, 4, 3),
+  })
+  local symbols = { class_sym }
 
-local function make_cs_buf(lines)
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(lines, "\n"))
-  vim.bo[buf].filetype = "cs"
-  vim.treesitter.get_parser(buf, "c_sharp"):parse()
-  return buf
-end
-
-local function teardown_buf(buf)
-  if vim.api.nvim_buf_is_valid(buf) then
-    vim.api.nvim_buf_delete(buf, { force = true })
-  end
-end
-
-describe("find_type_node_at_cursor + get_identifier", function()
-  if not cs_parser_available() then
-    pending("c_sharp treesitter parser not installed — skipping")
-    return
-  end
-
-  -- pos is 0-indexed {row, col} as expected by vim.treesitter.get_node
-  it("finds a class declaration and returns its name", function()
-    local buf = make_cs_buf("public class OrderService\n{\n}")
-    local node = h.find_type_node_at_cursor(buf, { 0, 15 })
-    assert.is_not_nil(node)
-    assert.equals("class_declaration", node:type())
-    assert.equals("OrderService", h.get_identifier(node, buf))
-    teardown_buf(buf)
+  it("finds a class when cursor is on its name", function()
+    -- selectionRange for "OrderService" is col 13..24; cursor at col 15
+    local sym = h.find_type_by_cursor(symbols, { 0, 15 })
+    assert.is_not_nil(sym)
+    assert.equals("OrderService", sym.name)
   end)
 
-  it("finds a struct declaration", function()
-    local buf = make_cs_buf("public struct Point\n{\n}")
-    local node = h.find_type_node_at_cursor(buf, { 0, 15 })
-    assert.is_not_nil(node)
-    assert.equals("struct_declaration", node:type())
-    assert.equals("Point", h.get_identifier(node, buf))
-    teardown_buf(buf)
+  it("finds a struct when cursor is on its name", function()
+    local struct_sym = make_sym("Point", SK.Struct, 0, 0, 3, 1)
+    local sym = h.find_type_by_cursor({ struct_sym }, { 0, 2 })
+    assert.is_not_nil(sym)
+    assert.equals("Point", sym.name)
   end)
 
-  it("finds an interface declaration", function()
-    local buf = make_cs_buf("public interface IRepository\n{\n}")
-    local node = h.find_type_node_at_cursor(buf, { 0, 20 })
-    assert.is_not_nil(node)
-    assert.equals("interface_declaration", node:type())
-    assert.equals("IRepository", h.get_identifier(node, buf))
-    teardown_buf(buf)
+  it("finds an interface when cursor is on its name", function()
+    local iface_sym = make_sym("IRepository", SK.Interface, 0, 0, 2, 1)
+    local sym = h.find_type_by_cursor({ iface_sym }, { 0, 5 })
+    assert.is_not_nil(sym)
+    assert.equals("IRepository", sym.name)
   end)
 
-  it("finds an enum declaration", function()
-    local buf = make_cs_buf("public enum Status\n{\n  Active,\n  Inactive\n}")
-    local node = h.find_type_node_at_cursor(buf, { 0, 13 })
-    assert.is_not_nil(node)
-    assert.equals("enum_declaration", node:type())
-    assert.equals("Status", h.get_identifier(node, buf))
-    teardown_buf(buf)
+  it("finds an enum when cursor is on its name", function()
+    local enum_sym = make_sym("Status", SK.Enum, 0, 0, 3, 1)
+    local sym = h.find_type_by_cursor({ enum_sym }, { 0, 3 })
+    assert.is_not_nil(sym)
+    assert.equals("Status", sym.name)
   end)
 
   it("returns nil when cursor is inside a method body", function()
-    local code = "public class MyService\n{\n  public void DoWork()\n  {\n    var x = 1;\n  }\n}"
-    local buf = make_cs_buf(code)
-    local node = h.find_type_node_at_cursor(buf, { 4, 8 }) -- row 4 = "    var x = 1;"
-    assert.is_nil(node)
-    teardown_buf(buf)
+    -- row 3, col 4 = "var x = 1;" — not on any type's selectionRange
+    local sym = h.find_type_by_cursor(symbols, { 3, 4 })
+    assert.is_nil(sym)
   end)
 
-  it("finds the type node when cursor is on the opening brace", function()
-    local buf = make_cs_buf("public class MyService\n{\n}")
-    local node = h.find_type_node_at_cursor(buf, { 1, 0 }) -- row 1 = "{"
-    assert.is_not_nil(node)
-    assert.equals("MyService", h.get_identifier(node, buf))
-    teardown_buf(buf)
+  it("returns nil when cursor is on the 'class' keyword, not the name", function()
+    -- selectionRange for "OrderService" is col 13..24; col 7 is on 'class' keyword
+    local sym = h.find_type_by_cursor(symbols, { 0, 7 })
+    assert.is_nil(sym)
+  end)
+
+  it("finds a nested type by recursing into children", function()
+    local inner = make_sym("Inner", SK.Class, 2, 2, 4, 3)
+    local outer = make_sym("Outer", SK.Class, 0, 0, 6, 1, { inner })
+    local sym = h.find_type_by_cursor({ outer }, { 2, 4 })
+    assert.is_not_nil(sym)
+    assert.equals("Inner", sym.name)
+  end)
+
+  it("returns nil for an empty symbol list", function()
+    assert.is_nil(h.find_type_by_cursor({}, { 0, 0 }))
+  end)
+
+  it("matches cursor on the very first character of the name (left boundary)", function()
+    -- selectionRange for "OrderService" is col 13..24; col 13 is first char
+    local sym = h.find_type_by_cursor(symbols, { 0, 13 })
+    assert.is_not_nil(sym)
+    assert.equals("OrderService", sym.name)
+  end)
+
+  it("matches cursor on the very last character of the name (right boundary)", function()
+    -- "OrderService" is 12 chars; last char is at col 13+11=24
+    local sym = h.find_type_by_cursor(symbols, { 0, 24 })
+    assert.is_not_nil(sym)
+    assert.equals("OrderService", sym.name)
+  end)
+
+  it("returns nil when cursor is past the end of the name", function()
+    -- selectionRange end.character = 13+12 = 25; pos_in_range is inclusive on ec,
+    -- so col 25 is the last accepted position. Col 26 is the first that misses.
+    assert.is_nil(h.find_type_by_cursor(symbols, { 0, 26 }))
+  end)
+
+  it("finds the correct type when two sibling types share the same file", function()
+    local cls1 = make_sym("Alpha", SK.Class,     0, 0, 4, 1, 13)
+    local cls2 = make_sym("Beta",  SK.Interface, 6, 0, 9, 1, 17)
+    -- cursor on "Beta"'s selectionRange
+    local sym = h.find_type_by_cursor({ cls1, cls2 }, { 6, 18 })
+    assert.is_not_nil(sym)
+    assert.equals("Beta", sym.name)
+  end)
+
+  it("finds a type nested inside a namespace symbol", function()
+    -- Roslyn wraps top-level types in a Namespace symbol (SK.Namespace = 3)
+    local inner_cls = make_sym("MyService", SK.Class, 2, 0, 8, 1, 7)
+    local ns_sym    = {
+      name = "MyApp", kind = SK.Namespace or 3,
+      range          = { start = { line = 0, character = 0 }, ["end"] = { line = 10, character = 0 } },
+      selectionRange = { start = { line = 0, character = 10 }, ["end"] = { line = 0, character = 15 } },
+      children       = { inner_cls },
+    }
+    local sym = h.find_type_by_cursor({ ns_sym }, { 2, 9 })
+    assert.is_not_nil(sym)
+    assert.equals("MyService", sym.name)
   end)
 end)
 
@@ -146,5 +203,21 @@ describe("do_rename_file", function()
     open_tmp_file("MyClass.cs", "public class MyClass {}")
     h.do_rename_file("MyClass", "NewName")
     assert.equals(1, vim.fn.filereadable(tmp .. "/OtherClass.cs"))
+  end)
+
+  it("renames all compound variants that share the same stem", function()
+    -- Renaming MyClass.cs while MyClass.Queries.cs and MyClass.Commands.cs
+    -- also exist. The function only renames the CURRENT buffer's file; the
+    -- other compound files are left for the user to rename separately.
+    open_tmp_file("MyClass.Queries.cs",  "public partial class MyClass {}")
+    open_tmp_file("MyClass.Commands.cs", "public partial class MyClass {}")
+    local old_path = open_tmp_file("MyClass.cs", "public partial class MyClass {}")
+    h.do_rename_file("MyClass", "OrderService")
+    -- only the active buffer's file was renamed
+    assert.equals(1, vim.fn.filereadable(tmp .. "/OrderService.cs"))
+    assert.equals(0, vim.fn.filereadable(old_path))
+    -- sibling partial files are untouched
+    assert.equals(1, vim.fn.filereadable(tmp .. "/MyClass.Queries.cs"))
+    assert.equals(1, vim.fn.filereadable(tmp .. "/MyClass.Commands.cs"))
   end)
 end)

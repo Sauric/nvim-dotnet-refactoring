@@ -117,12 +117,22 @@ local function make_class_partial(bufnr, class_sym)
   local row  = class_sym.range.start.line
   local line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1]
   if not line or line:match("%f[%w]partial%f[%W]") then return end
-  -- gsub with 1 replacement so only the first keyword match is changed
-  local new_line = line
-    :gsub("(%f[%w])(class%f[%W])",  "%1partial %2", 1)
-    :gsub("(%f[%w])(struct%f[%W])", "%1partial %2", 1)
-    :gsub("(%f[%w])(record%f[%W])", "%1partial %2", 1)
-  vim.api.nvim_buf_set_lines(bufnr, row, row + 1, false, { new_line })
+  -- Try compound keywords before their components so "record struct" is not
+  -- split into two separate substitutions.
+  local patterns = {
+    "(%f[%w])(record%s+struct%f[%W])",
+    "(%f[%w])(record%s+class%f[%W])",
+    "(%f[%w])(record%f[%W])",
+    "(%f[%w])(struct%f[%W])",
+    "(%f[%w])(class%f[%W])",
+  }
+  for _, pat in ipairs(patterns) do
+    local new_line, n = line:gsub(pat, "%1partial %2", 1)
+    if n > 0 then
+      vim.api.nvim_buf_set_lines(bufnr, row, row + 1, false, { new_line })
+      return
+    end
+  end
 end
 
 local function remove_members(bufnr, members)

@@ -55,6 +55,23 @@ describe("pos_in_range", function()
   it("returns false when pos col is after end on the end line", function()
     assert.is_false(h.pos_in_range({ 5, 10 }, range(1, 0, 5, 5)))
   end)
+
+  -- single-line ranges: both column constraints apply simultaneously
+  it("returns true for single-line range when col is inside", function()
+    assert.is_true(h.pos_in_range({ 3, 7 }, range(3, 5, 3, 10)))
+  end)
+
+  it("returns true for single-line range when col equals end (inclusive)", function()
+    assert.is_true(h.pos_in_range({ 3, 10 }, range(3, 5, 3, 10)))
+  end)
+
+  it("returns false for single-line range when col is one past end", function()
+    assert.is_false(h.pos_in_range({ 3, 11 }, range(3, 5, 3, 10)))
+  end)
+
+  it("returns false for single-line range when col is before start", function()
+    assert.is_false(h.pos_in_range({ 3, 4 }, range(3, 5, 3, 10)))
+  end)
 end)
 
 -- ── find_class_by_cursor ─────────────────────────────────────────────────────
@@ -80,6 +97,34 @@ describe("find_class_by_cursor", function()
     local outer   = sym("Outer", SK.Class, 2, 0, 10, 1, { inner })
     local found   = h.find_class_by_cursor({ outer }, { 5, 10 })
     assert.equals("Inner", found.name)
+  end)
+
+  it("finds the class when cursor is on the exact declaration line (start boundary)", function()
+    local found = h.find_class_by_cursor(symbols, { 2, 5 })
+    assert.is_not_nil(found)
+    assert.equals("OrderService", found.name)
+  end)
+
+  it("finds the class when cursor is on the exact closing-brace line (end boundary)", function()
+    -- cls ends at line 10, col 1
+    local found = h.find_class_by_cursor(symbols, { 10, 0 })
+    assert.is_not_nil(found)
+    assert.equals("OrderService", found.name)
+  end)
+
+  it("finds the correct class when two sibling classes are present", function()
+    local cls1 = sym("First",  SK.Class, 0, 0, 4,  1, {})
+    local cls2 = sym("Second", SK.Class, 6, 0, 10, 1, {})
+    local found = h.find_class_by_cursor({ cls1, cls2 }, { 7, 5 })
+    assert.is_not_nil(found)
+    assert.equals("Second", found.name)
+  end)
+
+  it("finds a struct (CONTAINER_KINDS includes SK.Struct)", function()
+    local struct_sym = sym("Point", SK.Struct, 0, 0, 4, 1, {})
+    local found = h.find_class_by_cursor({ struct_sym }, { 2, 0 })
+    assert.is_not_nil(found)
+    assert.equals("Point", found.name)
   end)
 end)
 
@@ -113,6 +158,26 @@ describe("find_member_by_cursor", function()
     assert.is_not_nil(found)
     -- same table reference
     assert.equals(prop_full, found)
+  end)
+
+  it("returns nil when the class has no children", function()
+    local empty_cls = sym("Empty", SK.Class, 0, 0, 3, 1)
+    assert.is_nil(h.find_member_by_cursor(empty_cls, { 1, 0 }))
+  end)
+
+  it("returns the member when cursor is on its last line (end boundary)", function()
+    -- method spans lines 5–7; cursor at line 7 is the closing brace
+    local found = h.find_member_by_cursor(cls, { 7, 4 })
+    assert.is_not_nil(found)
+    assert.equals("DoWork", found.name)
+  end)
+
+  it("finds a constructor member", function()
+    local ctor = sym("MyService(string)", SK.Constructor, 3, 4, 5, 5)
+    local cls3  = sym("MyService", SK.Class, 0, 0, 10, 1, { ctor })
+    local found = h.find_member_by_cursor(cls3, { 4, 8 })
+    assert.is_not_nil(found)
+    assert.equals("MyService(string)", found.name)
   end)
 end)
 
@@ -155,6 +220,34 @@ describe("symbol_to_member", function()
     local m = h.symbol_to_member(sym("Status", SK.Enum, 0, 0, 2, 1))
     assert.equals("nested enum", m.kind)
   end)
+
+  it("labels operator correctly", function()
+    local m = h.symbol_to_member(sym("op_Addition(int, int) : int", SK.Operator, 0, 0, 1, 0))
+    assert.equals("operator", m.kind)
+    -- name stripped to identifier before '('
+    assert.equals("op_Addition", m.name)
+  end)
+
+  it("labels nested class correctly", function()
+    local m = h.symbol_to_member(sym("Builder", SK.Class, 0, 0, 5, 1))
+    assert.equals("nested class", m.kind)
+  end)
+
+  it("labels nested struct correctly", function()
+    local m = h.symbol_to_member(sym("Entry", SK.Struct, 0, 0, 3, 1))
+    assert.equals("nested struct", m.kind)
+  end)
+
+  it("labels nested interface correctly", function()
+    local m = h.symbol_to_member(sym("IHandler", SK.Interface, 0, 0, 2, 1))
+    assert.equals("nested interface", m.kind)
+  end)
+
+  it("falls back to 'member' for unmapped SymbolKind", function()
+    -- Use a SymbolKind value not in KIND_LABEL (e.g. Module = 2)
+    local m = h.symbol_to_member(sym("SomeThing", 2, 0, 0, 1, 0))
+    assert.equals("member", m.kind)
+  end)
 end)
 
 -- ── get_file_context ─────────────────────────────────────────────────────────
@@ -183,6 +276,25 @@ describe("get_file_context", function()
     local buf = make_buf("public class Bare {}")
     local usings, ns = h.get_file_context(buf)
     assert.equals(0, #usings)
+    assert.is_nil(ns)
+    teardown(buf)
+  end)
+
+  it("ignores using directives that are indented (inside a namespace block)", function()
+    -- Only top-level 'using' lines (matching ^using) are captured.
+    local code = "namespace MyApp\n{\n    using System;\n    public class Foo {}\n}"
+    local buf = make_buf(code)
+    local usings, ns = h.get_file_context(buf)
+    assert.equals(0, #usings)
+    assert.equals("MyApp", ns)
+    teardown(buf)
+  end)
+
+  it("captures multiple usings when there is no namespace", function()
+    local code = "using System;\nusing System.IO;\n\npublic class Bare {}"
+    local buf = make_buf(code)
+    local usings, ns = h.get_file_context(buf)
+    assert.equals(2, #usings)
     assert.is_nil(ns)
     teardown(buf)
   end)
@@ -217,6 +329,46 @@ describe("make_class_partial", function()
     h.make_class_partial(buf, class_sym)
     local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1]
     assert.truthy(line:find("partial struct Point", 1, true))
+    teardown(buf)
+  end)
+
+  it("works for record", function()
+    local buf      = make_buf("public record Person\n{\n}")
+    local class_sym = sym("Person", SK.Class, 0, 0, 2, 1)
+    h.make_class_partial(buf, class_sym)
+    local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1]
+    assert.truthy (line:find("partial record Person", 1, true))
+    assert.falsy  (line:find("partial record partial", 1, true))
+    teardown(buf)
+  end)
+
+  it("works for record struct without double-inserting partial", function()
+    local buf      = make_buf("public record struct Point\n{\n}")
+    local class_sym = sym("Point", SK.Struct, 0, 0, 2, 1)
+    h.make_class_partial(buf, class_sym)
+    local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1]
+    assert.truthy (line:find("partial record struct Point", 1, true))
+    assert.falsy  (line:find("partial record partial", 1, true))
+    teardown(buf)
+  end)
+
+  it("works when there are no leading modifiers", function()
+    local buf      = make_buf("class MyHelper\n{\n}")
+    local class_sym = sym("MyHelper", SK.Class, 0, 0, 2, 1)
+    h.make_class_partial(buf, class_sym)
+    local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1]
+    assert.equals("partial class MyHelper", line)
+    teardown(buf)
+  end)
+
+  it("works for 'record class' without double-inserting partial", function()
+    local buf      = make_buf("public record class Person\n{\n}")
+    local class_sym = sym("Person", SK.Class, 0, 0, 2, 1)
+    h.make_class_partial(buf, class_sym)
+    local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1]
+    assert.truthy(line:find("partial record class Person", 1, true))
+    assert.falsy (line:find("partial record partial",     1, true))
+    assert.falsy (line:find("partial class partial",       1, true))
     teardown(buf)
   end)
 end)
@@ -274,6 +426,49 @@ describe("remove_members", function()
     local content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
     assert.truthy(content:find("_name", 1, true))
     assert.truthy(content:find("Name",  1, true))
+    teardown(buf)
+  end)
+
+  it("consumes blank lines that follow a removed member", function()
+    -- Buffer where DoWork is followed by a blank line before Name
+    local code = table.concat({
+      "public class Foo",    -- 0
+      "{",                   -- 1
+      "    public void DoWork() {}", -- 2
+      "",                    -- 3  ← blank line to consume
+      "    public string Name { get; set; }", -- 4
+      "}",                   -- 5
+    }, "\n")
+    local buf     = make_buf(code)
+    local members = { make_member("DoWork", SK.Method, 2, 2) }
+    h.remove_members(buf, members)
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    -- No double blank line: the blank line after DoWork should be gone
+    local has_double_blank = false
+    for i = 1, #lines - 1 do
+      if lines[i]:match("^%s*$") and lines[i + 1]:match("^%s*$") then
+        has_double_blank = true
+      end
+    end
+    assert.is_false(has_double_blank)
+    assert.truthy(table.concat(lines, "\n"):find("Name", 1, true))
+    teardown(buf)
+  end)
+
+  it("removes a member that is the last line before the closing brace", function()
+    local code = table.concat({
+      "public class Foo", -- 0
+      "{",               -- 1
+      "    public void Last() {}", -- 2
+      "}",               -- 3
+    }, "\n")
+    local buf     = make_buf(code)
+    local members = { make_member("Last", SK.Method, 2, 2) }
+    h.remove_members(buf, members)
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local content = table.concat(lines, "\n")
+    assert.falsy (content:find("Last",  1, true))
+    assert.truthy(content:find("class Foo", 1, true))
     teardown(buf)
   end)
 end)
@@ -342,6 +537,161 @@ describe("build_partial_content", function()
 
     assert.falsy (content:find("namespace", 1, true))
     assert.truthy(content:find("partial class Bare", 1, true))
+    teardown(buf)
+  end)
+
+  it("inserts a blank line between multiple extracted members", function()
+    local buf       = make_buf(SOURCE)
+    local class_sym = sym("OrderService", SK.Class, 5, 0, 9, 1, {
+      sym("_name",  SK.Field,  7, 4, 7, 30),
+      sym("DoWork", SK.Method, 8, 4, 8, 30),
+    })
+    local name_m   = { symbol = class_sym.children[1], name = "_name",
+                       display = "_name", kind = "field" }
+    local dowork_m = { symbol = class_sym.children[2], name = "DoWork",
+                       display = "DoWork()", kind = "method" }
+    local content = joined(h.build_partial_content(class_sym, "OrderService", { name_m, dowork_m }, buf))
+
+    -- Both members present
+    assert.truthy(content:find("_name",  1, true))
+    assert.truthy(content:find("DoWork", 1, true))
+    -- A blank line separates them: "_name" line followed eventually by a blank line before "DoWork"
+    assert.truthy(content:find("_name.-\n\n.-DoWork", 1, false))
+    teardown(buf)
+  end)
+
+  it("includes usings even when there is no namespace", function()
+    local code = "using System;\nusing System.IO;\n\npublic class Helper\n{\n    public void Run() {}\n}"
+    local buf  = make_buf(code)
+    local class_sym = sym("Helper", SK.Class, 3, 0, 6, 1, {
+      sym("Run", SK.Method, 5, 4, 5, 30),
+    })
+    local run_m = { symbol = class_sym.children[1], name = "Run",
+                    display = "Run()", kind = "method" }
+    local content = joined(h.build_partial_content(class_sym, "Helper", { run_m }, buf))
+
+    assert.truthy(content:find("using System;",    1, true))
+    assert.truthy(content:find("using System.IO;", 1, true))
+    assert.falsy (content:find("namespace",         1, true))
+    assert.truthy(content:find("partial class Helper", 1, true))
+    teardown(buf)
+  end)
+end)
+
+-- ── real C# file content — records and record structs ────────────────────────
+
+describe("real C# file content", function()
+  local function joined(lines) return table.concat(lines, "\n") end
+
+  -- Realistic record with a file-scoped namespace
+  local RECORD_SOURCE = table.concat({
+    "using System;",
+    "",
+    "namespace MyApp.Domain;",
+    "",
+    "public record Person",
+    "{",
+    "    public string FirstName { get; init; }",
+    "    public string LastName  { get; init; }",
+    "    public string FullName() => $\"{FirstName} {LastName}\";",
+    "}",
+  }, "\n")
+
+  -- Realistic record struct with a file-scoped namespace
+  local RECORD_STRUCT_SOURCE = table.concat({
+    "using System;",
+    "",
+    "namespace MyApp.Geometry;",
+    "",
+    "public record struct Point",
+    "{",
+    "    public double X { get; init; }",
+    "    public double Y { get; init; }",
+    "    public double Distance() => Math.Sqrt(X * X + Y * Y);",
+    "}",
+  }, "\n")
+
+  -- Public static class — modifiers must NOT appear in the extracted file
+  local STATIC_SOURCE = table.concat({
+    "namespace MyApp;",
+    "",
+    "public static class MathHelper",
+    "{",
+    "    public static int Add(int a, int b) => a + b;",
+    "    public static int Multiply(int a, int b) => a * b;",
+    "}",
+  }, "\n")
+
+  it("make_class_partial: inserts partial before 'record'", function()
+    local buf       = make_buf(RECORD_SOURCE)
+    local class_sym = sym("Person", SK.Class, 4, 0, 9, 1)
+    h.make_class_partial(buf, class_sym)
+    local line = vim.api.nvim_buf_get_lines(buf, 4, 5, false)[1]
+    assert.truthy(line:find("partial record Person", 1, true))
+    assert.falsy (line:find("partial record partial", 1, true))
+    teardown(buf)
+  end)
+
+  it("make_class_partial: inserts partial before 'record struct' as a unit", function()
+    local buf       = make_buf(RECORD_STRUCT_SOURCE)
+    local class_sym = sym("Point", SK.Struct, 4, 0, 9, 1)
+    h.make_class_partial(buf, class_sym)
+    local line = vim.api.nvim_buf_get_lines(buf, 4, 5, false)[1]
+    assert.equals("public partial record struct Point", line)
+    teardown(buf)
+  end)
+
+  it("build_partial_content: generates 'partial record' without access modifiers", function()
+    local buf       = make_buf(RECORD_SOURCE)
+    local class_sym = sym("Person", SK.Class, 4, 0, 9, 1, {
+      sym("FirstName", SK.Property, 6, 4, 6, 42),
+      sym("LastName",  SK.Property, 7, 4, 7, 42),
+      sym("FullName",  SK.Method,   8, 4, 8, 50),
+    })
+    local fullname_m = { symbol = class_sym.children[3], name = "FullName",
+                         display = "FullName()", kind = "method" }
+    local content = joined(h.build_partial_content(class_sym, "Person", { fullname_m }, buf))
+
+    assert.truthy(content:find("partial record Person",           1, true))
+    assert.falsy (content:find("public partial",                 1, true))
+    assert.truthy(content:find("FullName",                       1, true))
+    -- FirstName appears inside FullName's body ($"{FirstName}…"), but the
+    -- property declaration line must NOT be present.
+    assert.falsy (content:find("FirstName { get; init; }",       1, true))
+    teardown(buf)
+  end)
+
+  it("build_partial_content: generates 'partial record struct' without access modifiers", function()
+    local buf       = make_buf(RECORD_STRUCT_SOURCE)
+    local class_sym = sym("Point", SK.Struct, 4, 0, 9, 1, {
+      sym("X",        SK.Property, 6, 4, 6, 35),
+      sym("Y",        SK.Property, 7, 4, 7, 35),
+      sym("Distance", SK.Method,   8, 4, 8, 55),
+    })
+    local dist_m = { symbol = class_sym.children[3], name = "Distance",
+                     display = "Distance()", kind = "method" }
+    local content = joined(h.build_partial_content(class_sym, "Point", { dist_m }, buf))
+
+    assert.truthy(content:find("partial record struct Point", 1, true))
+    assert.falsy (content:find("public partial",              1, true))
+    assert.truthy(content:find("Distance",                    1, true))
+    teardown(buf)
+  end)
+
+  it("build_partial_content: public static class produces bare 'partial class'", function()
+    local buf       = make_buf(STATIC_SOURCE)
+    local class_sym = sym("MathHelper", SK.Class, 2, 0, 6, 1, {
+      sym("Add",      SK.Method, 4, 4, 4, 45),
+      sym("Multiply", SK.Method, 5, 4, 5, 48),
+    })
+    local add_m = { symbol = class_sym.children[1], name = "Add",
+                    display = "Add()", kind = "method" }
+    local content = joined(h.build_partial_content(class_sym, "MathHelper", { add_m }, buf))
+
+    assert.truthy(content:find("partial class MathHelper",  1, true))
+    assert.falsy (content:find("public partial",            1, true))
+    assert.falsy (content:find("static partial",            1, true))
+    assert.truthy(content:find("Add",                       1, true))
     teardown(buf)
   end)
 end)
