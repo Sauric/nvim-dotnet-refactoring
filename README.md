@@ -23,7 +23,7 @@ Rider-style refactoring commands for C# in Neovim, powered by the built-in LSP c
 -- ~/.config/nvim/lua/plugins/nvim-dotnet-refactoring.lua
 return {
   {
-    "your-github-username/nvim-dotnet-refactoring",
+    "Sauric/nvim-dotnet-refactoring",
     ft   = "cs",
     opts = {},
     keys = {
@@ -58,7 +58,7 @@ return {
 Clone the repository into your Neovim runtime path:
 
 ```bash
-git clone https://github.com/your-github-username/nvim-dotnet-refactoring \
+git clone https://github.com/Sauric/nvim-dotnet-refactoring \
   ~/.local/share/nvim/site/pack/plugins/start/nvim-dotnet-refactoring
 ```
 
