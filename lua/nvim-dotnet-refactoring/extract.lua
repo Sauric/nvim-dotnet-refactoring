@@ -149,7 +149,6 @@ local CLASS_KW = { class_declaration = "class", struct_declaration = "struct",
 
 local function build_partial_content(class_sym, class_name, members, bufnr)
   local usings, ns, is_file_scoped = get_file_context(bufnr)
-  local mods = get_class_modifiers(bufnr, class_sym)
 
   -- Infer keyword from the class declaration line
   local class_row  = class_sym.range.start.line
@@ -160,12 +159,7 @@ local function build_partial_content(class_sym, class_name, members, bufnr)
           or "class"
 
   local function class_decl(indent)
-    local parts = {}
-    if mods ~= "" then parts[#parts + 1] = mods end
-    parts[#parts + 1] = "partial"
-    parts[#parts + 1] = kw
-    parts[#parts + 1] = class_name
-    return indent .. table.concat(parts, " ")
+    return indent .. "partial " .. kw .. " " .. class_name
   end
 
   local member_lines = {}
