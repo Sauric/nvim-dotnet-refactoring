@@ -74,12 +74,11 @@ end
 -- ── symbol → member struct ───────────────────────────────────────────────────
 
 local function symbol_to_member(sym)
-  local kind    = KIND_LABEL[sym.kind] or "member"
-  local display = sym.name
-  if kind == "method" or kind == "constructor" or kind == "operator" then
-    display = sym.name .. "()"
-  end
-  return { symbol = sym, name = sym.name, display = display, kind = kind }
+  local kind = KIND_LABEL[sym.kind] or "member"
+  -- Roslyn includes the full signature in sym.name, e.g. "Multiply(int, int) : int".
+  -- Strip everything from the first "(" or ":" so the filename stays clean.
+  local name = (sym.name:match("^([%w_]+)") or sym.name):gsub("%s+$", "")
+  return { symbol = sym, name = name, display = sym.name, kind = kind }
 end
 
 -- ── file context (buffer line scan — no Treesitter needed) ───────────────────
