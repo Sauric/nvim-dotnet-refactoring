@@ -1,17 +1,21 @@
 local extract = require("nvim-dotnet-refactoring.extract")
 local h       = extract._internals
+local SK      = h.SK
 
--- ── helpers ──────────────────────────────────────────────────────────────────
+-- ── mock helpers ─────────────────────────────────────────────────────────────
 
-local function cs_parser_available()
-  return pcall(vim.treesitter.language.add, "c_sharp")
+local function range(sl, sc, el, ec)
+  return { start = { line = sl, character = sc }, ["end"] = { line = el, character = ec } }
+end
+
+local function sym(name, kind, sl, sc, el, ec, children)
+  return { name = name, kind = kind, range = range(sl, sc, el, ec),
+           selectionRange = range(sl, sc, sl, sc + #name), children = children or {} }
 end
 
 local function make_buf(lines)
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(lines, "\n"))
-  vim.bo[buf].filetype = "cs"
-  vim.treesitter.get_parser(buf, "c_sharp"):parse()
   return buf
 end
 
@@ -21,193 +25,236 @@ local function teardown(buf)
   end
 end
 
--- Compact C# class used across many tests.
-local BASE_CLASS = table.concat({
-  "using System;",
-  "using System.Collections.Generic;",
-  "",
-  "namespace MyApp.Services;",
-  "",
-  "public class OrderService",
-  "{",
-  "    private readonly string _name;",
-  "    public string Name { get; set; }",
-  "    public OrderService(string name) { _name = name; }",
-  "    public void DoWork() { Console.WriteLine(_name); }",
-  "    public enum Status { Active, Inactive }",
-  "}",
-}, "\n")
+-- ── pos_in_range ─────────────────────────────────────────────────────────────
 
--- ── guard ────────────────────────────────────────────────────────────────────
-
-if not cs_parser_available() then
-  pending("c_sharp treesitter parser not installed — skipping extract_spec")
-  return
-end
-
--- ── find_member_at_cursor ────────────────────────────────────────────────────
-
-describe("find_member_at_cursor", function()
-  it("finds a method member", function()
-    local buf = make_buf(BASE_CLASS)
-    -- row 10 = "    public void DoWork() { ... }"
-    local node = h.find_member_at_cursor(buf, { 10, 20 })
-    assert.is_not_nil(node)
-    assert.equals("method_declaration", node:type())
-    teardown(buf)
+describe("pos_in_range", function()
+  it("returns true when pos is inside the range", function()
+    assert.is_true(h.pos_in_range({ 2, 10 }, range(1, 0, 5, 0)))
   end)
 
-  it("finds a property member", function()
-    local buf = make_buf(BASE_CLASS)
-    -- row 8 = "    public string Name { get; set; }"
-    local node = h.find_member_at_cursor(buf, { 8, 18 })
-    assert.is_not_nil(node)
-    assert.equals("property_declaration", node:type())
-    teardown(buf)
+  it("returns true when pos is on the start boundary", function()
+    assert.is_true(h.pos_in_range({ 1, 0 }, range(1, 0, 5, 0)))
   end)
 
-  it("finds a field member", function()
-    local buf = make_buf(BASE_CLASS)
-    -- row 7 = "    private readonly string _name;"
-    local node = h.find_member_at_cursor(buf, { 7, 28 })
-    assert.is_not_nil(node)
-    assert.equals("field_declaration", node:type())
-    teardown(buf)
+  it("returns true when pos is on the end boundary", function()
+    assert.is_true(h.pos_in_range({ 5, 0 }, range(1, 0, 5, 0)))
   end)
 
-  it("finds a constructor member", function()
-    local buf = make_buf(BASE_CLASS)
-    -- row 9 = "    public OrderService(string name) { ... }"
-    local node = h.find_member_at_cursor(buf, { 9, 15 })
-    assert.is_not_nil(node)
-    assert.equals("constructor_declaration", node:type())
-    teardown(buf)
+  it("returns false when pos row is before range", function()
+    assert.is_false(h.pos_in_range({ 0, 0 }, range(1, 0, 5, 0)))
   end)
 
-  it("finds a nested enum member", function()
-    local buf = make_buf(BASE_CLASS)
-    -- row 11 = "    public enum Status { Active, Inactive }"
-    local node = h.find_member_at_cursor(buf, { 11, 20 })
-    assert.is_not_nil(node)
-    assert.equals("enum_declaration", node:type())
-    teardown(buf)
+  it("returns false when pos row is after range", function()
+    assert.is_false(h.pos_in_range({ 6, 0 }, range(1, 0, 5, 0)))
+  end)
+
+  it("returns false when pos col is before start on the start line", function()
+    assert.is_false(h.pos_in_range({ 1, 0 }, range(1, 4, 5, 0)))
+  end)
+
+  it("returns false when pos col is after end on the end line", function()
+    assert.is_false(h.pos_in_range({ 5, 10 }, range(1, 0, 5, 5)))
+  end)
+end)
+
+-- ── find_class_by_cursor ─────────────────────────────────────────────────────
+
+describe("find_class_by_cursor", function()
+  local method  = sym("DoWork",       SK.Method,   3, 4, 5, 5)
+  local prop    = sym("Name",         SK.Property, 6, 4, 6, 40)
+  local cls     = sym("OrderService", SK.Class,    2, 0, 10, 1, { method, prop })
+  local symbols = { cls }
+
+  it("finds the class when cursor is inside it", function()
+    local found = h.find_class_by_cursor(symbols, { 4, 10 })
+    assert.is_not_nil(found)
+    assert.equals("OrderService", found.name)
+  end)
+
+  it("returns nil when cursor is outside all classes", function()
+    assert.is_nil(h.find_class_by_cursor(symbols, { 0, 0 }))
+  end)
+
+  it("finds a nested class when symbols are wrapped in a namespace symbol", function()
+    local inner   = sym("Inner", SK.Class, 4, 4, 8, 5, {})
+    local outer   = sym("Outer", SK.Class, 2, 0, 10, 1, { inner })
+    local found   = h.find_class_by_cursor({ outer }, { 5, 10 })
+    assert.equals("Inner", found.name)
+  end)
+end)
+
+-- ── find_member_by_cursor ────────────────────────────────────────────────────
+
+describe("find_member_by_cursor", function()
+  local method = sym("DoWork", SK.Method,   5, 4, 7, 5)
+  local prop   = sym("Name",   SK.Property, 9, 4, 9, 40)
+  local cls    = sym("Svc",    SK.Class,    2, 0, 12, 1, { method, prop })
+
+  it("returns the member whose range contains the cursor", function()
+    local found = h.find_member_by_cursor(cls, { 6, 10 })
+    assert.is_not_nil(found)
+    assert.equals("DoWork", found.name)
   end)
 
   it("returns nil when cursor is on the class declaration line", function()
-    local buf = make_buf(BASE_CLASS)
-    -- row 5 = "public class OrderService"
-    local node = h.find_member_at_cursor(buf, { 5, 14 })
-    assert.is_nil(node)
-    teardown(buf)
+    assert.is_nil(h.find_member_by_cursor(cls, { 2, 10 }))
+  end)
+
+  it("returns nil when cursor is between members", function()
+    assert.is_nil(h.find_member_by_cursor(cls, { 8, 0 }))
   end)
 end)
 
--- ── find_enclosing_class ─────────────────────────────────────────────────────
+-- ── symbol_to_member ─────────────────────────────────────────────────────────
 
-describe("find_enclosing_class", function()
-  it("finds the class when cursor is inside a method body", function()
-    local buf = make_buf(BASE_CLASS)
-    local node = h.find_enclosing_class(buf, { 10, 25 })
-    assert.is_not_nil(node)
-    assert.equals("class_declaration", node:type())
-    teardown(buf)
+describe("symbol_to_member", function()
+  it("appends () to methods", function()
+    local m = h.symbol_to_member(sym("DoWork", SK.Method, 0, 0, 2, 0))
+    assert.equals("DoWork()", m.display)
+    assert.equals("method",   m.kind)
   end)
 
-  it("finds the class when cursor is on the class line itself", function()
-    local buf = make_buf(BASE_CLASS)
-    local node = h.find_enclosing_class(buf, { 5, 14 })
-    assert.is_not_nil(node)
-    assert.equals("class_declaration", node:type())
-    teardown(buf)
+  it("appends () to constructors", function()
+    local m = h.symbol_to_member(sym("MyClass", SK.Constructor, 0, 0, 2, 0))
+    assert.equals("MyClass()", m.display)
+    assert.equals("constructor", m.kind)
   end)
 
-  it("returns nil when cursor is outside any class", function()
-    local buf = make_buf(BASE_CLASS)
-    -- row 0 = "using System;"
-    local node = h.find_enclosing_class(buf, { 0, 5 })
-    assert.is_nil(node)
-    teardown(buf)
-  end)
-end)
-
--- ── get_all_members ──────────────────────────────────────────────────────────
-
-describe("get_all_members", function()
-  it("lists all members with correct names and kinds", function()
-    local buf = make_buf(BASE_CLASS)
-    local class_node = h.find_enclosing_class(buf, { 10, 0 })
-    local members = h.get_all_members(class_node, buf)
-
-    assert.equals(5, #members)
-
-    assert.equals("_name",        members[1].name)
-    assert.equals("field",        members[1].kind)
-    assert.equals("Name",         members[2].name)
-    assert.equals("property",     members[2].kind)
-    assert.equals("OrderService", members[3].name)
-    assert.equals("constructor",  members[3].kind)
-    assert.equals("DoWork",       members[4].name)
-    assert.equals("method",       members[4].kind)
-    assert.equals("Status",       members[5].name)
-    assert.equals("nested enum",  members[5].kind)
-
-    teardown(buf)
+  it("does not append () to properties", function()
+    local m = h.symbol_to_member(sym("Name", SK.Property, 0, 0, 0, 30))
+    assert.equals("Name",     m.display)
+    assert.equals("property", m.kind)
   end)
 
-  it("appends () to method and constructor display names", function()
-    local buf = make_buf(BASE_CLASS)
-    local class_node = h.find_enclosing_class(buf, { 10, 0 })
-    local members = h.get_all_members(class_node, buf)
+  it("does not append () to fields", function()
+    local m = h.symbol_to_member(sym("_count", SK.Field, 0, 0, 0, 30))
+    assert.equals("_count", m.display)
+    assert.equals("field",  m.kind)
+  end)
 
-    assert.equals("DoWork()",       members[4].display)
-    assert.equals("OrderService()", members[3].display)
-    assert.equals("Name",           members[2].display)
-    teardown(buf)
+  it("labels nested class correctly", function()
+    local m = h.symbol_to_member(sym("Status", SK.Enum, 0, 0, 2, 1))
+    assert.equals("nested enum", m.kind)
   end)
 end)
 
--- ── get_namespace_info ───────────────────────────────────────────────────────
+-- ── get_file_context ─────────────────────────────────────────────────────────
 
-describe("get_namespace_info", function()
-  it("detects file-scoped namespace", function()
-    local buf = make_buf(BASE_CLASS)
-    local ns, is_fs = h.get_namespace_info(buf)
-    assert.equals("MyApp.Services", ns)
+describe("get_file_context", function()
+  it("extracts usings and file-scoped namespace", function()
+    local buf = make_buf("using System;\nusing System.Linq;\n\nnamespace MyApp.Services;\n\npublic class Foo {}")
+    local usings, ns, is_fs = h.get_file_context(buf)
+    assert.equals(2, #usings)
+    assert.equals("using System;",       usings[1])
+    assert.equals("using System.Linq;",  usings[2])
+    assert.equals("MyApp.Services",      ns)
     assert.is_true(is_fs)
     teardown(buf)
   end)
 
-  it("detects traditional namespace", function()
-    local code = "namespace MyApp.Services\n{\n    public class Svc\n    {\n    }\n}"
-    local buf  = make_buf(code)
-    local ns, is_fs = h.get_namespace_info(buf)
-    assert.equals("MyApp.Services", ns)
+  it("detects traditional (block) namespace", function()
+    local buf = make_buf("namespace MyApp\n{\n    public class Foo {}\n}")
+    local _, ns, is_fs = h.get_file_context(buf)
+    assert.equals("MyApp", ns)
     assert.is_false(is_fs)
     teardown(buf)
   end)
 
-  it("returns nil when there is no namespace", function()
-    local buf = make_buf("public class Bare\n{\n    public void M() {}\n}")
-    local ns  = h.get_namespace_info(buf)
+  it("returns nil namespace and empty usings when neither exist", function()
+    local buf = make_buf("public class Bare {}")
+    local usings, ns = h.get_file_context(buf)
+    assert.equals(0, #usings)
     assert.is_nil(ns)
     teardown(buf)
   end)
 end)
 
--- ── get_member_name (field special case) ─────────────────────────────────────
+-- ── make_class_partial ───────────────────────────────────────────────────────
 
-describe("get_member_name", function()
-  it("correctly extracts field name from nested AST", function()
-    local buf  = make_buf(BASE_CLASS)
-    local tree = vim.treesitter.get_parser(buf, "c_sharp"):parse()[1]
-    local root = tree:root()
-    -- row 7 = the field declaration
-    local field_node = root:named_descendant_for_range(7, 4, 7, 4)
-    while field_node and field_node:type() ~= "field_declaration" do
-      field_node = field_node:parent()
-    end
-    assert.is_not_nil(field_node)
-    assert.equals("_name", h.get_member_name(field_node, buf))
+describe("make_class_partial", function()
+  it("inserts 'partial' before 'class'", function()
+    local buf      = make_buf("using System;\n\npublic class OrderService\n{\n}")
+    local class_sym = sym("OrderService", SK.Class, 2, 0, 4, 1)
+    h.make_class_partial(buf, class_sym)
+    local lines = vim.api.nvim_buf_get_lines(buf, 2, 3, false)
+    assert.truthy(lines[1]:find("partial class OrderService", 1, true))
+    teardown(buf)
+  end)
+
+  it("is idempotent", function()
+    local buf      = make_buf("public class Svc\n{\n}")
+    local class_sym = sym("Svc", SK.Class, 0, 0, 2, 1)
+    h.make_class_partial(buf, class_sym)
+    h.make_class_partial(buf, class_sym)
+    local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1]
+    local _, count = line:gsub("partial", "")
+    assert.equals(1, count)
+    teardown(buf)
+  end)
+
+  it("works for struct", function()
+    local buf      = make_buf("public struct Point\n{\n}")
+    local class_sym = sym("Point", SK.Struct, 0, 0, 2, 1)
+    h.make_class_partial(buf, class_sym)
+    local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1]
+    assert.truthy(line:find("partial struct Point", 1, true))
+    teardown(buf)
+  end)
+end)
+
+-- ── remove_members ───────────────────────────────────────────────────────────
+
+describe("remove_members", function()
+  -- 10-line buffer matching the line numbers used in the member symbols
+  local SOURCE = table.concat({
+    "using System;",             -- 0
+    "",                          -- 1
+    "namespace MyApp;",          -- 2
+    "",                          -- 3
+    "public class OrderService", -- 4
+    "{",                         -- 5
+    "    private string _name;", -- 6
+    "    public string Name { get; set; }",   -- 7
+    "    public void DoWork() {}",            -- 8
+    "}",                         -- 9
+  }, "\n")
+
+  local function make_member(name, kind, sl, el)
+    local s = sym(name, kind, sl, 4, el, 4)
+    return { symbol = s, name = name, display = name, kind = h.KIND_LABEL[kind] or "member" }
+  end
+
+  it("removes the selected member", function()
+    local buf     = make_buf(SOURCE)
+    local members = { make_member("DoWork", SK.Method, 8, 8) }
+    h.remove_members(buf, members)
+    local content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    assert.falsy(content:find("DoWork", 1, true))
+    assert.truthy(content:find("_name", 1, true))
+    teardown(buf)
+  end)
+
+  it("removes multiple members without corrupting positions", function()
+    local buf = make_buf(SOURCE)
+    local members = {
+      make_member("_name",  SK.Field,    6, 6),
+      make_member("DoWork", SK.Method,   8, 8),
+    }
+    h.remove_members(buf, members)
+    local content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    assert.falsy(content:find("DoWork",  1, true))
+    assert.falsy(content:find("_name",   1, true))
+    assert.truthy(content:find("Name",   1, true))
+    teardown(buf)
+  end)
+
+  it("leaves unselected members intact", function()
+    local buf     = make_buf(SOURCE)
+    local members = { make_member("DoWork", SK.Method, 8, 8) }
+    h.remove_members(buf, members)
+    local content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    assert.truthy(content:find("_name", 1, true))
+    assert.truthy(content:find("Name",  1, true))
     teardown(buf)
   end)
 end)
@@ -217,112 +264,64 @@ end)
 describe("build_partial_content", function()
   local function joined(lines) return table.concat(lines, "\n") end
 
-  it("produces a file-scoped partial class with the extracted method", function()
-    local buf        = make_buf(BASE_CLASS)
-    local class_node = h.find_enclosing_class(buf, { 10, 0 })
-    local members    = h.get_all_members(class_node, buf)
-    -- extract just DoWork (index 4)
-    local content    = joined(h.build_partial_content(class_node, "OrderService", { members[4] }, buf))
+  local SOURCE = table.concat({
+    "using System;",
+    "using System.Linq;",
+    "",
+    "namespace MyApp.Services;",
+    "",
+    "public class OrderService",
+    "{",
+    "    private string _name;",
+    "    public void DoWork() {}",
+    "}",
+  }, "\n")
 
-    assert.truthy(content:find("using System;", 1, true))
-    assert.truthy(content:find("namespace MyApp.Services;", 1, true))
+  it("produces file-scoped partial with usings, namespace, and member", function()
+    local buf       = make_buf(SOURCE)
+    local class_sym = sym("OrderService", SK.Class, 5, 0, 9, 1, {
+      sym("_name",  SK.Field,  7, 4, 7, 30),
+      sym("DoWork", SK.Method, 8, 4, 8, 30),
+    })
+    local dowork_m = { symbol = class_sym.children[2], name = "DoWork",
+                       display = "DoWork()", kind = "method" }
+    local content  = joined(h.build_partial_content(class_sym, "OrderService", { dowork_m }, buf))
+
+    assert.truthy(content:find("using System;",                  1, true))
+    assert.truthy(content:find("namespace MyApp.Services;",      1, true))
     assert.truthy(content:find("public partial class OrderService", 1, true))
-    assert.truthy(content:find("DoWork", 1, true))
-    -- must NOT contain the field declaration that wasn't selected
-    assert.falsy(content:find("private readonly string _name", 1, true))
+    assert.truthy(content:find("DoWork",                         1, true))
+    assert.falsy (content:find("private string _name",           1, true))
     teardown(buf)
   end)
 
-  it("wraps with block namespace when source uses traditional namespace", function()
+  it("wraps in block namespace when source uses traditional style", function()
     local code = "using System;\nnamespace MyApp\n{\n    public class Svc\n    {\n        public void Run() {}\n    }\n}"
     local buf  = make_buf(code)
-    local class_node = h.find_enclosing_class(buf, { 5, 0 })
-    local members    = h.get_all_members(class_node, buf)
-    local content    = joined(h.build_partial_content(class_node, "Svc", members, buf))
+    local class_sym = sym("Svc", SK.Class, 3, 4, 7, 5, {
+      sym("Run", SK.Method, 5, 8, 5, 30),
+    })
+    local run_m  = { symbol = class_sym.children[1], name = "Run",
+                     display = "Run()", kind = "method" }
+    local content = joined(h.build_partial_content(class_sym, "Svc", { run_m }, buf))
 
     assert.truthy(content:find("namespace MyApp\n{", 1, true))
-    assert.truthy(content:find("partial class Svc", 1, true))
+    assert.truthy(content:find("partial class Svc",  1, true))
     teardown(buf)
   end)
 
-  it("omits namespace wrapper when there is no namespace", function()
+  it("omits namespace when there is none", function()
     local code = "public class Bare\n{\n    public void M() {}\n}"
     local buf  = make_buf(code)
-    local class_node = h.find_enclosing_class(buf, { 2, 0 })
-    local members    = h.get_all_members(class_node, buf)
-    local content    = joined(h.build_partial_content(class_node, "Bare", members, buf))
+    local class_sym = sym("Bare", SK.Class, 0, 0, 3, 1, {
+      sym("M", SK.Method, 2, 4, 2, 25),
+    })
+    local m_m  = { symbol = class_sym.children[1], name = "M",
+                   display = "M()", kind = "method" }
+    local content = joined(h.build_partial_content(class_sym, "Bare", { m_m }, buf))
 
-    assert.falsy(content:find("namespace", 1, true))
+    assert.falsy (content:find("namespace", 1, true))
     assert.truthy(content:find("partial class Bare", 1, true))
-    teardown(buf)
-  end)
-end)
-
--- ── make_class_partial ───────────────────────────────────────────────────────
-
-describe("make_class_partial", function()
-  it("inserts 'partial' before the class keyword", function()
-    local buf        = make_buf(BASE_CLASS)
-    local class_node = h.find_enclosing_class(buf, { 10, 0 })
-    h.make_class_partial(buf, class_node)
-    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    local class_line = table.concat(lines, "\n"):match("[^\n]*(partial class OrderService)[^\n]*")
-    assert.is_not_nil(class_line)
-    teardown(buf)
-  end)
-
-  it("is idempotent — does not double 'partial'", function()
-    local buf        = make_buf(BASE_CLASS)
-    local class_node = h.find_enclosing_class(buf, { 10, 0 })
-    h.make_class_partial(buf, class_node)
-    h.make_class_partial(buf, class_node)
-    local content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-    -- should appear exactly once
-    local _, count = content:gsub("partial class OrderService", "")
-    assert.equals(1, count)
-    teardown(buf)
-  end)
-end)
-
--- ── remove_members ───────────────────────────────────────────────────────────
-
-describe("remove_members", function()
-  it("removes selected members from the buffer", function()
-    local buf        = make_buf(BASE_CLASS)
-    local class_node = h.find_enclosing_class(buf, { 10, 0 })
-    local members    = h.get_all_members(class_node, buf)
-    -- remove DoWork (index 4)
-    h.remove_members(buf, { members[4] })
-    local content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-    assert.falsy(content:find("DoWork", 1, true))
-    -- other members still present
-    assert.truthy(content:find("_name", 1, true))
-    assert.truthy(content:find("Status", 1, true))
-    teardown(buf)
-  end)
-
-  it("does not remove members that were not selected", function()
-    local buf        = make_buf(BASE_CLASS)
-    local class_node = h.find_enclosing_class(buf, { 10, 0 })
-    local members    = h.get_all_members(class_node, buf)
-    h.remove_members(buf, { members[4] })  -- only DoWork
-    local content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-    assert.truthy(content:find("Name", 1, true))
-    assert.truthy(content:find("Status", 1, true))
-    teardown(buf)
-  end)
-
-  it("removes multiple members without corrupting line positions", function()
-    local buf        = make_buf(BASE_CLASS)
-    local class_node = h.find_enclosing_class(buf, { 10, 0 })
-    local members    = h.get_all_members(class_node, buf)
-    -- remove Name (property, index 2) and DoWork (method, index 4)
-    h.remove_members(buf, { members[2], members[4] })
-    local content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-    assert.falsy(content:find("public string Name", 1, true))
-    assert.falsy(content:find("DoWork", 1, true))
-    assert.truthy(content:find("_name", 1, true))
-    assert.truthy(content:find("Status", 1, true))
     teardown(buf)
   end)
 end)
